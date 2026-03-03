@@ -44,8 +44,10 @@ export default function AuthScreen({ onSignIn, onSignUp, onGoogle }: AuthScreenP
     try {
       await onGoogle();
     } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : "Google sign-in failed";
-      setError(message.replace("Firebase: ", "").replace(/\(auth\/.*\)/, "").trim());
+      const raw = err instanceof Error ? err.message : "Google sign-in failed";
+      // Strip Firebase prefix/error codes for cleaner display
+      const cleaned = raw.replace("Firebase: ", "").replace(/\s*\(auth\/[^)]+\)\.?/g, "").trim();
+      setError(cleaned || "Google sign-in failed. Please try email/password instead.");
     } finally {
       setLoading(false);
     }

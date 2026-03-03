@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useState, useRef, useCallback } from "react";
+import React, { useState, useRef, useCallback, useEffect } from "react";
 import { useTheme } from "@/contexts/ThemeContext";
 import { useDesign } from "@/contexts/DesignContext";
 import ConfirmModal from "@/components/ConfirmModal";
@@ -8,7 +8,7 @@ import { NoteItem, NoteFolder, NoteTodo } from "@/lib/firestore";
 import {
   Plus, Trash2, X, FolderOpen, Folder, Lock, Unlock, Search,
   Mic, MicOff, Image as ImageIcon, CheckSquare, Square, Maximize2,
-  ChevronLeft, FolderPlus,
+  ChevronLeft, ChevronRight, FolderPlus, Download, ZoomIn,
 } from "lucide-react";
 
 const NOTE_COLORS = [
@@ -45,6 +45,7 @@ export default function NotesTab({
   const [activeFolderId, setActiveFolderId] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState("");
   const [fullscreenNote, setFullscreenNote] = useState<NoteItem | null>(null);
+  const [viewerImage, setViewerImage] = useState<{ noteId: string; idx: number } | null>(null);
   const [showNewFolder, setShowNewFolder] = useState(false);
   const [newFolderName, setNewFolderName] = useState("");
   const [newFolderColor, setNewFolderColor] = useState(FOLDER_COLORS[0]);
@@ -57,6 +58,57 @@ export default function NotesTab({
   const [unlockedFolders, setUnlockedFolders] = useState<Set<string>>(new Set());
   const [newNoteText, setNewNoteText] = useState("");
   const [isRecording, setIsRecording] = useState(false);
+  const [toastError, setToastError] = useState<string | null>(null);
+
+  // PIN modal state
+  const [pinModal, setPinModal] = useState<{
+    type: 'note' | 'folder';
+    id: string;
+    action: 'set' | 'change';
+    currentPin?: string;
+  } | null>(null);
+  const [pinModalStep, setPinModalStep] = useState<'verify' | 'new'>('new');
+  const [pinModalValue, setPinModalValue] = useState('');
+  const [pinModalConfirm, setPinModalConfirm] = useState('');
+  const [pinModalError, setPinModalError] = useState('');
+
+  /* Image viewer helpers */
+  const getViewerImages = (noteId: string) => {
+    const note = notes.find(n => n.id === noteId);
+    return note?.images || [];
+  };
+
+  const downloadImage = (src: string, idx: number) => {
+    const a = document.createElement("a");
+    a.href = src;
+    a.download = `note-image-${idx + 1}.${src.startsWith("data:image/png") ? "png" : src.startsWith("data:image/gif") ? "gif" : "jpg"}`;
+    a.click();
+  };
+
+  const showError = (msg: string) => {
+    setToastError(msg);
+    setTimeout(() => setToastError(null), 4000);
+  };
+
+  /* Keyboard navigation for image viewer */
+  useEffect(() => {
+    if (!viewerImage) return;
+    const handleKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setViewerImage(null);
+      if (e.key === "ArrowLeft") setViewerImage(v => {
+        if (!v || v.idx === 0) return v;
+        return { ...v, idx: v.idx - 1 };
+      });
+      if (e.key === "ArrowRight") setViewerImage(v => {
+        if (!v) return v;
+        const imgs = getViewerImages(v.noteId);
+        if (v.idx >= imgs.length - 1) return v;
+        return { ...v, idx: v.idx + 1 };
+      });
+    };
+    window.addEventListener("keydown", handleKey);
+    return () => window.removeEventListener("keydown", handleKey);
+  }, [viewerImage]);
 
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const audioChunksRef = useRef<Blob[]>([]);
@@ -150,8 +202,8 @@ export default function NotesTab({
   const handleImageUpload = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file || !uploadTargetId) return;
-    if (file.size > 2 * 1024 * 1024) {
-      alert("Image must be under 2MB.");
+    if (file.size > 100 * 1024 * 1024) {
+      showError("Image must be under 100 MB.");
       return;
     }
     const reader = new FileReader();
@@ -197,7 +249,7 @@ export default function NotesTab({
       recorder.start();
       setIsRecording(true);
     } catch {
-      alert("Could not access microphone.");
+      showError("Could not access microphone. Please allow microphone access.");
     }
   };
 
@@ -256,15 +308,52 @@ export default function NotesTab({
     if (fullscreenNote?.id === noteId) setFullscreenNote(updated);
   };
 
+  /* PIN modal helpers */
+  const openPinModal = (type: 'note' | 'folder', id: string, action: 'set' | 'change', currentPin?: string) => {
+    setPinModal({ type, id, action, currentPin });
+    setPinModalStep(action === 'change' ? 'verify' : 'new');
+    setPinModalValue('');
+    setPinModalConfirm('');
+    setPinModalError('');
+  };
+
+  const handlePinModalSubmit = (submitAction: 'remove-lock' | 'proceed-change' | 'save-pin') => {
+    if (!pinModal) return;
+    const { type, id, currentPin } = pinModal;
+    if (submitAction === 'remove-lock') {
+      if (pinModalValue !== currentPin) { setPinModalError('Incorrect PIN.'); return; }
+      if (type === 'note') {
+        const note = notes.find(n => n.id === id);
+        if (note) onEditNote({ ...note, locked: false, lockPin: undefined, updatedAt: new Date().toISOString() });
+      } else {
+        onFoldersChange(folders.map(f => f.id === id ? { ...f, locked: false, lockPin: undefined } : f));
+      }
+      setPinModal(null);
+    } else if (submitAction === 'proceed-change') {
+      if (pinModalValue !== currentPin) { setPinModalError('Incorrect current PIN.'); return; }
+      setPinModalStep('new');
+      setPinModalValue('');
+      setPinModalConfirm('');
+      setPinModalError('');
+    } else if (submitAction === 'save-pin') {
+      if (!pinModalValue) { setPinModalError('PIN cannot be empty.'); return; }
+      if (pinModalValue !== pinModalConfirm) { setPinModalError('PINs do not match.'); return; }
+      if (type === 'note') {
+        const note = notes.find(n => n.id === id);
+        if (note) onEditNote({ ...note, locked: true, lockPin: pinModalValue, updatedAt: new Date().toISOString() });
+      } else {
+        onFoldersChange(folders.map(f => f.id === id ? { ...f, locked: true, lockPin: pinModalValue } : f));
+      }
+      setPinModal(null);
+    }
+  };
+
   /* Lock/unlock a note */
   const toggleNoteLock = (note: NoteItem) => {
     if (note.locked) {
-      onEditNote({ ...note, locked: false, lockPin: undefined, updatedAt: new Date().toISOString() });
+      openPinModal('note', note.id, 'change', note.lockPin);
     } else {
-      const pin = prompt("Set a PIN for this note:");
-      if (pin) {
-        onEditNote({ ...note, locked: true, lockPin: pin, updatedAt: new Date().toISOString() });
-      }
+      openPinModal('note', note.id, 'set');
     }
   };
 
@@ -325,8 +414,18 @@ export default function NotesTab({
         {imageCount > 0 && (
           <div className="flex gap-1 flex-wrap mt-2">
             {(note.images || []).slice(0, 3).map((img, i) => (
-              // eslint-disable-next-line @next/next/no-img-element
-              <img key={i} src={img} alt="" className={`w-10 h-10 object-cover ${isNeo ? 'border border-black' : 'rounded'}`} />
+              <button
+                key={i}
+                onClick={() => { setFullscreenNote(note); setViewerImage({ noteId: note.id, idx: i }); }}
+                className={`relative group/thumb w-10 h-10 flex-shrink-0 overflow-hidden ${isNeo ? 'border border-black' : 'rounded'} cursor-zoom-in`}
+                title="View image"
+              >
+                {/* eslint-disable-next-line @next/next/no-img-element */}
+                <img src={img} alt="" className="w-full h-full object-cover" />
+                <span className="absolute inset-0 bg-black/30 opacity-0 group-hover/thumb:opacity-100 transition-opacity flex items-center justify-center">
+                  <ZoomIn size={12} className="text-white" />
+                </span>
+              </button>
             ))}
             {imageCount > 3 && <span className="text-[10px] text-gray-500 self-end">+{imageCount - 3}</span>}
           </div>
@@ -416,14 +515,30 @@ export default function NotesTab({
               <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
                 {(note.images || []).map((img, i) => (
                   <div key={i} className="relative group/img">
-                    {/* eslint-disable-next-line @next/next/no-img-element */}
-                    <img src={img} alt="" className={`w-full h-32 object-cover ${isNeo ? 'border-2 border-black' : 'rounded-lg'}`} />
                     <button
-                      onClick={() => removeImage(note.id, i)}
-                      className="absolute top-1 right-1 p-1 bg-red-500 text-white rounded-full opacity-0 group-hover/img:opacity-100 transition-opacity"
+                      onClick={() => setViewerImage({ noteId: note.id, idx: i })}
+                      className={`w-full h-32 overflow-hidden block cursor-zoom-in ${isNeo ? 'border-2 border-black' : 'rounded-lg'}`}
                     >
-                      <X size={10} />
+                      {/* eslint-disable-next-line @next/next/no-img-element */}
+                      <img src={img} alt="" className="w-full h-full object-cover hover:scale-105 transition-transform duration-200" />
                     </button>
+                    {/* Hover actions: download + delete */}
+                    <div className="absolute top-1 right-1 flex gap-1 opacity-0 group-hover/img:opacity-100 transition-opacity">
+                      <button
+                        onClick={() => downloadImage(img, i)}
+                        className="p-1 bg-white/90 text-gray-700 rounded-full shadow hover:bg-white"
+                        title="Download"
+                      >
+                        <Download size={10} />
+                      </button>
+                      <button
+                        onClick={() => removeImage(note.id, i)}
+                        className="p-1 bg-red-500 text-white rounded-full shadow"
+                        title="Delete"
+                      >
+                        <X size={10} />
+                      </button>
+                    </div>
                   </div>
                 ))}
               </div>
@@ -531,6 +646,15 @@ export default function NotesTab({
               {folder.locked && !unlockedFolders.has(folder.id) ? <Lock size={12} /> : <Folder size={14} />}
               {folder.name}
             </button>
+            {folder.locked && (
+              <button
+                onClick={(e) => { e.stopPropagation(); openPinModal('folder', folder.id, 'change', folder.lockPin); }}
+                className="absolute -top-1 left-1 p-0.5 bg-amber-400 text-black rounded-full opacity-0 group-hover/folder:opacity-100 transition-opacity"
+                title="Change folder PIN"
+              >
+                <Lock size={8} />
+              </button>
+            )}
             <button
               onClick={() => setDeleteFolderConfirm(folder.id)}
               className="absolute -top-1 -right-1 p-0.5 bg-red-500 text-white rounded-full opacity-0 group-hover/folder:opacity-100 transition-opacity"
@@ -612,6 +736,118 @@ export default function NotesTab({
       {/* Hidden file input for image uploads */}
       <input type="file" accept="image/*" ref={fileInputRef} onChange={handleImageUpload} className="hidden" />
 
+      {/* ───── Fullscreen image viewer overlay ───── */}
+      {viewerImage && (() => {
+        const imgs = getViewerImages(viewerImage.noteId);
+        const current = imgs[viewerImage.idx];
+        if (!current) return null;
+        const hasPrev = viewerImage.idx > 0;
+        const hasNext = viewerImage.idx < imgs.length - 1;
+        return (
+          <div
+            className="fixed inset-0 z-[150] flex flex-col bg-black/95"
+            onClick={() => setViewerImage(null)}
+          >
+            {/* Top bar: counter + download + close */}
+            <div className="flex items-center justify-between px-5 py-3 flex-shrink-0" onClick={e => e.stopPropagation()}>
+              <div className={`px-3 py-1 text-xs font-bold text-white ${
+                isNeo ? 'border-2 border-white bg-black' : 'rounded-full bg-white/15 backdrop-blur'
+              }`}>
+                {viewerImage.idx + 1} / {imgs.length}
+              </div>
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={() => downloadImage(current, viewerImage.idx)}
+                  className={`flex items-center gap-1.5 px-3 py-1.5 text-sm font-bold text-white ${
+                    isNeo
+                      ? 'border-2 border-white bg-black shadow-[3px_3px_0px_white]'
+                      : 'rounded-xl bg-white/15 backdrop-blur hover:bg-white/25 border border-white/30'
+                  }`}
+                >
+                  <Download size={14} /> Download
+                </button>
+                <button
+                  onClick={() => setViewerImage(null)}
+                  className={`p-2 text-white ${
+                    isNeo
+                      ? 'border-2 border-white bg-black shadow-[3px_3px_0px_white]'
+                      : 'rounded-xl bg-white/15 backdrop-blur hover:bg-white/25'
+                  }`}
+                >
+                  <X size={20} />
+                </button>
+              </div>
+            </div>
+
+            {/* Middle: prev arrow · image · next arrow */}
+            <div className="flex-1 flex items-center gap-3 px-4 min-h-0" onClick={e => e.stopPropagation()}>
+              {/* Prev */}
+              <div className="flex-shrink-0 w-14 flex justify-center">
+                {hasPrev && (
+                  <button
+                    onClick={() => setViewerImage(v => v ? { ...v, idx: v.idx - 1 } : null)}
+                    className={`p-3 text-white transition-colors ${
+                      isNeo ? 'border-2 border-white bg-black shadow-[3px_3px_0px_white] font-bold' : 'rounded-full bg-white/20 backdrop-blur hover:bg-white/40'
+                    }`}
+                  >
+                    <ChevronLeft size={30} />
+                  </button>
+                )}
+              </div>
+
+              {/* Image */}
+              <div className="flex-1 flex items-center justify-center min-h-0 overflow-hidden">
+                {/* eslint-disable-next-line @next/next/no-img-element */}
+                <img
+                  src={current}
+                  alt=""
+                  className={`max-w-full max-h-full object-contain select-none ${
+                    isNeo ? 'border-2 border-white shadow-[6px_6px_0px_0px_rgba(255,255,255,0.2)]' : 'rounded-xl shadow-2xl'
+                  }`}
+                  style={{ maxHeight: 'calc(100vh - 130px)' }}
+                />
+              </div>
+
+              {/* Next */}
+              <div className="flex-shrink-0 w-14 flex justify-center">
+                {hasNext && (
+                  <button
+                    onClick={() => setViewerImage(v => v ? { ...v, idx: v.idx + 1 } : null)}
+                    className={`p-3 text-white transition-colors ${
+                      isNeo ? 'border-2 border-white bg-black shadow-[3px_3px_0px_white] font-bold' : 'rounded-full bg-white/20 backdrop-blur hover:bg-white/40'
+                    }`}
+                  >
+                    <ChevronRight size={30} />
+                  </button>
+                )}
+              </div>
+            </div>
+
+            {/* Bottom hint */}
+            <div className="flex-shrink-0 py-3 text-center">
+              <p className="text-white/30 text-xs">Click outside or press Esc to close · ← → to navigate</p>
+            </div>
+          </div>
+        );
+      })()}
+
+      {/* Design-aware toast error */}
+      {toastError && (
+        <div className={`fixed bottom-6 left-1/2 -translate-x-1/2 z-[200] px-5 py-3 text-sm font-medium flex items-center gap-3 ${
+          isNeo
+            ? 'bg-white border-2 border-black shadow-[4px_4px_0px_0px_rgba(0,0,0,0.8)] text-black font-bold'
+            : isGlass
+            ? 'backdrop-blur-2xl bg-red-500/30 border border-red-400/40 rounded-xl text-white'
+            : `${colors.surface} border ${colors.border} rounded-xl ${colors.cardShadow} ${colors.text}`
+        }`}>
+          <span className="text-red-500">⚠</span>
+          {toastError}
+          <button onClick={() => setToastError(null)} className="ml-2 opacity-60 hover:opacity-100">
+            <X size={14} />
+          </button>
+        </div>
+      )}
+
       {/* Fullscreen note editor overlay */}
       {renderFullscreenEditor()}
 
@@ -638,6 +874,84 @@ export default function NotesTab({
               <button onClick={tryUnlock} className={`flex-1 px-4 py-2 text-sm text-white ${colors.primary} ${btnCls}`}>Unlock</button>
               <button onClick={() => { setUnlockPrompt(null); setUnlockPin(""); }} className={`flex-1 px-4 py-2 text-sm ${textCls} ${isNeo ? 'border-2 border-black' : `rounded-xl border ${colors.border}`}`}>Cancel</button>
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* PIN modal: set / change / remove lock */}
+      {pinModal && (
+        <div className="fixed inset-0 z-[110] flex items-center justify-center bg-black/50 p-4" onClick={() => setPinModal(null)}>
+          <div className={`w-full max-w-sm ${isNeo ? 'bg-white border-2 border-black shadow-[6px_6px_0px]' : `${colors.surface} rounded-2xl border ${colors.border}`} p-6`} onClick={e => e.stopPropagation()}>
+            <div className="flex items-center gap-2 mb-1">
+              <Lock size={20} className={textCls} />
+              <h3 className={`font-bold text-base ${textCls}`}>
+                {pinModal.action === 'set'
+                  ? (pinModal.type === 'note' ? 'Lock Note with PIN' : 'Lock Folder with PIN')
+                  : pinModalStep === 'verify' ? 'Change PIN' : 'Set New PIN'}
+              </h3>
+            </div>
+            <p className={`text-xs ${textSecCls} mb-4`}>
+              {pinModal.action === 'set'
+                ? `This ${pinModal.type} will be protected by your PIN.`
+                : pinModalStep === 'verify'
+                ? 'Enter your current PIN to continue.'
+                : 'Enter and confirm your new PIN.'}
+            </p>
+
+            {pinModal.action === 'change' && pinModalStep === 'verify' ? (
+              /* Verify existing PIN step */
+              <>
+                <input
+                  type="password"
+                  value={pinModalValue}
+                  onChange={e => { setPinModalValue(e.target.value); setPinModalError(''); }}
+                  onKeyDown={e => { if (e.key === 'Enter') handlePinModalSubmit('proceed-change'); }}
+                  placeholder="Current PIN..."
+                  autoFocus
+                  className={`w-full px-3 py-2 text-sm ${isNeo ? 'border-2 border-black' : `rounded-lg border ${colors.border}`} ${colors.inputBg} ${textCls} outline-none mb-2`}
+                />
+                {pinModalError && <p className="text-red-500 text-xs mb-2">{pinModalError}</p>}
+                <div className="flex flex-col gap-2 mt-3">
+                  <button onClick={() => handlePinModalSubmit('proceed-change')} className={`w-full px-4 py-2 text-sm text-white ${colors.primary} ${btnCls}`}>
+                    Continue to New PIN
+                  </button>
+                  <button onClick={() => handlePinModalSubmit('remove-lock')} className={`w-full px-4 py-2 text-sm text-red-600 font-semibold ${isNeo ? 'border-2 border-black' : `rounded-xl border border-red-300 hover:bg-red-50`}`}>
+                    Remove Lock
+                  </button>
+                  <button onClick={() => setPinModal(null)} className={`w-full px-4 py-2 text-sm ${textCls} ${isNeo ? 'border-2 border-black' : `rounded-xl border ${colors.border}`}`}>
+                    Cancel
+                  </button>
+                </div>
+              </>
+            ) : (
+              /* Set / new PIN step */
+              <>
+                <input
+                  type="password"
+                  value={pinModalValue}
+                  onChange={e => { setPinModalValue(e.target.value); setPinModalError(''); }}
+                  onKeyDown={e => { if (e.key === 'Enter') handlePinModalSubmit('save-pin'); }}
+                  placeholder="New PIN..."
+                  autoFocus
+                  className={`w-full px-3 py-2 text-sm ${isNeo ? 'border-2 border-black' : `rounded-lg border ${colors.border}`} ${colors.inputBg} ${textCls} outline-none mb-2`}
+                />
+                <input
+                  type="password"
+                  value={pinModalConfirm}
+                  onChange={e => { setPinModalConfirm(e.target.value); setPinModalError(''); }}
+                  onKeyDown={e => { if (e.key === 'Enter') handlePinModalSubmit('save-pin'); }}
+                  placeholder="Confirm PIN..."
+                  className={`w-full px-3 py-2 text-sm ${isNeo ? 'border-2 border-black' : `rounded-lg border ${colors.border}`} ${colors.inputBg} ${textCls} outline-none mb-2`}
+                />
+                {pinModalError && <p className="text-red-500 text-xs mb-2">{pinModalError}</p>}
+                <div className="flex gap-2 mt-3">
+                  <button onClick={() => handlePinModalSubmit('save-pin')} className={`flex-1 px-4 py-2 text-sm text-white ${colors.primary} ${btnCls}`}>
+                    {pinModal.action === 'set' ? (pinModal.type === 'note' ? 'Lock Note' : 'Lock Folder') : 'Save PIN'}
+                  </button>
+                  <button onClick={() => setPinModal(null)} className={`flex-1 px-4 py-2 text-sm ${textCls} ${isNeo ? 'border-2 border-black' : `rounded-xl border ${colors.border}`}`}>Cancel</button>
+                </div>
+              </>
+            )}
           </div>
         </div>
       )}

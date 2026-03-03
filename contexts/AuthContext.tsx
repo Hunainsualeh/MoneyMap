@@ -52,7 +52,21 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const signInWithGoogle = async () => {
     const provider = new GoogleAuthProvider();
     provider.setCustomParameters({ prompt: "select_account" });
-    await signInWithPopup(auth, provider);
+    try {
+      await signInWithPopup(auth, provider);
+    } catch (err: unknown) {
+      // Map common Firebase auth error codes to readable messages
+      const code = (err as { code?: string })?.code ?? "";
+      if (code === "auth/unauthorized-domain") {
+        throw new Error(
+          "This domain is not authorized for Google sign-in. Please use email/password to log in, or contact support."
+        );
+      }
+      if (code === "auth/popup-closed-by-user" || code === "auth/cancelled-popup-request") {
+        throw new Error("Sign-in cancelled.");
+      }
+      throw err;
+    }
   };
 
   const signOut = async () => {
